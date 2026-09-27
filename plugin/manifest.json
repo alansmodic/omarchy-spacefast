@@ -19,7 +19,8 @@
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
-      "refreshIntervalSec": 300
+      "refreshIntervalSec": 300,
+      "brandAccent": true
     },
     "schema": [
       {
@@ -30,6 +31,12 @@
         "max": 3600,
         "step": 30,
         "defaultValue": 300
+      },
+      {
+        "key": "brandAccent",
+        "type": "boolean",
+        "label": "Lime accent on the SF mark",
+        "defaultValue": true
       }
     ]
   }

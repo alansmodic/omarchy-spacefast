@@ -36,7 +36,14 @@ the widget still publishes anonymously with curl and lists what you published fr
 
 ## Settings
 
-`refreshIntervalSec` (default 300) in the widget's entry in `~/.config/omarchy/shell.json`.
+In the widget's entry in `~/.config/omarchy/shell.json`:
+
+- `refreshIntervalSec` (default 300).
+- `brandAccent` (default `true`): the lime offset on the SF mark. Set it to `false` for a
+  plain monochrome icon.
+
+The bar icon is Spacefast's "SF" mark, drawn natively (`SpacefastIcon.qml`) from the paths in
+the dashboard favicon, so it stays crisp at bar size and follows your theme's icon color.
 
 ## IPC
 

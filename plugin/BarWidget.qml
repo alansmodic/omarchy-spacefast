@@ -60,11 +60,26 @@ BarWidget {
     }
   }
 
+  Component {
+    id: markComponent
+    Item {
+      SpacefastIcon {
+        anchors.centerIn: parent
+        iconSize: Style.bar.iconCanvas
+        color: button.foreground
+        accent: root.setting("brandAccent", true) !== false
+      }
+    }
+  }
+
   BarIconButton {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: panelLoader.item ? panelLoader.item.label : "󰖟"
+    // The SF mark normally; an hourglass glyph while a publish is running.
+    readonly property bool publishing: panelLoader.item ? panelLoader.item.publishing === true : false
+    text: publishing ? "󰔟" : ""
+    iconComponent: publishing ? null : markComponent
     slotSize: Style.bar.statusSlot
     tooltipText: panelLoader.item ? panelLoader.item.tooltip : "Spacefast"
 
