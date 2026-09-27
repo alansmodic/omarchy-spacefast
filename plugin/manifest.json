@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "spacefast.spaces",
+  "name": "Spacefast",
+  "version": "0.1.0",
+  "author": "omarchy-spacefast contributors",
+  "license": "MIT",
+  "description": "Publish folders, files, and the clipboard to the web with Spacefast, and see, open, share, and claim your spaces from the bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Spacefast",
+    "description": "Your Spacefast spaces: open, copy a share link, claim, and publish new ones.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 300
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 30,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 300
+      }
+    ]
+  }
+}

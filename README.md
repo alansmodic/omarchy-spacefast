@@ -1,0 +1,119 @@
+# omarchy-spacefast
+
+Put things on the web from [Omarchy](https://omarchy.org) with
+[Spacefast](https://spacefast.com). You pick a file, folder, or the clipboard, get a live URL,
+and a link goes on your clipboard. No account is needed for the first publish.
+
+There are three pieces. Install them together or one at a time:
+
+| Piece | What you get | Folder |
+|---|---|---|
+| **Share menu** | Omarchy menu → Trigger → Share → **Web**: publish a file, folder, or the clipboard; My Spaces; Sign in | [`share/`](share) |
+| **Bar widget** | A Spacefast button in the bar. Click it for your spaces (open, copy a share link, claim), right-click to publish a folder | [`plugin/`](plugin) |
+| **Agent skill** | Ask Claude Code, Codex, or pi to "put this online" and they offer Spacefast. They still use another host if you name one or the project already has one | [`skill/`](skill) |
+
+All three share one small command, [`omarchy-spacefast`](bin/omarchy-spacefast), which does
+the publishing.
+
+## Install
+
+```bash
+git clone <this repo> omarchy-spacefast && cd omarchy-spacefast
+./install.sh                 # everything
+./install.sh share skill     # only the pieces you name: share, plugin, skill
+./install.sh --uninstall     # remove everything (or: ./install.sh plugin --uninstall)
+```
+
+Each folder also installs on its own (`share/install.sh`, `plugin/install.sh`,
+`skill/install.sh`). `scripts/build-dist.sh` packs each piece into its own tarball so you can
+pass one along without the rest.
+
+The bar widget can also live in its own repository, since Omarchy installs plugins from git:
+
+```bash
+omarchy plugin add https://github.com/<owner>/omarchy-spacefast-plugin.git --enable
+```
+
+`scripts/build-dist.sh` writes that repository's contents to `dist/omarchy-spacefast-plugin/`.
+
+### What gets installed where
+
+| Piece | Files |
+|---|---|
+| Share menu | `~/.local/bin/omarchy-spacefast`, plus a marked block in `~/.config/omarchy/extensions/omarchy-menu.jsonc`. Uninstall removes exactly that block |
+| Bar widget | `~/.config/omarchy/plugins/spacefast.spaces/`, placed on the right of the bar |
+| Agent skill | `~/.local/share/omarchy-spacefast/skills/omarchy-spacefast`, linked into `~/.agents/skills`, `~/.claude/skills`, `~/.codex/skills` and `~/.pi/agent/skills` (for the agents you have) |
+| Spacefast CLI | `sf`, installed with `omarchy-mise-install npm:spacefast sf`, the same way Omarchy ships its other npm tools. Skip it with `--no-cli` |
+
+Requirements: `jq` and `curl` (both come with Omarchy). The `sf` CLI is optional. Without it,
+publishing falls back to a single anonymous upload with curl.
+
+## How publishing works
+
+- **Engine.** `omarchy-spacefast` uses `sf` if it's installed, then `npx spacefast`, and
+  otherwise zips the files and uploads them with curl. Set `OMARCHY_SPACEFAST_ENGINE=curl` to
+  force the curl path.
+- **Updates, not duplicates.** Publishing the same file or folder again updates its space and
+  adds a new immutable version (`v2`, `v3`, …). Use `--new` to create a separate space.
+- **Anonymous (not signed in).**
+  - The space is private.
+  - You get a private preview link, which is copied for you and must not be shared because it
+    can manage the space.
+  - The space expires about 33 hours after the last publish unless you claim it. Claiming signs
+    you in with WordPress.com. Click the notification, or run `omarchy-spacefast claim <id>`.
+- **Signed in (`omarchy-spacefast login`).**
+  - The space is kept.
+  - A viewer share link is created and copied. Set `OMARCHY_SPACEFAST_ACCESS=public` to make
+    new spaces public, or `=private` to skip the share link.
+- **What gets left out.** `.env*` files, `.git`, `node_modules` and `.spacefast` are never
+  uploaded. With `sf`, git-ignored files are left out too.
+- **Clipboard.** Images become an image page, HTML is published as-is, and text becomes a
+  readable page.
+
+```bash
+omarchy-spacefast publish ./dist           # a folder or built site
+omarchy-spacefast publish report.html      # one file
+omarchy-spacefast publish clipboard        # whatever is on the clipboard
+omarchy-spacefast spaces                   # recent publishes + your account's spaces
+omarchy-spacefast copy|open|claim <id>
+omarchy-spacefast status
+```
+
+## Known issues
+
+- **Several teams, no default.** If your Spacefast account belongs to more than one team, new
+  spaces need a team. Pick a default once with `sf teams switch <slug>` (or
+  `npx spacefast teams switch <slug>`), or pass `--team <slug>` / set `SPACEFAST_TEAM`.
+- **`sf` through mise.** mise's supply-chain check currently refuses `spacefast@0.4.1` from npm.
+  An earlier release was published with npm trusted-publisher provenance and this one has none.
+  The installers detect this, remove the broken `sf` wrapper, and publishing falls back to
+  `npx spacefast` (or curl without Node). The fix belongs upstream: publishing `spacefast`
+  releases with provenance. Until then, don't bypass mise's trust policy just for this.
+
+## Security notes
+
+- Claim keys and anonymous preview links are stored only in
+  `~/.local/state/omarchy-spacefast/spaces.json` (mode 600). `--json` output, the bar widget, and
+  the agent skill never show them.
+- The bar panel takes keyboard focus when it opens. So publishing and signing in are
+  **click-only**: a stray keystroke can't send anything to the internet. Every publish from the
+  menu or panel also goes through the file chooser, except "Clipboard", which you pick
+  explicitly.
+- The skill tells agents to confirm before publishing, to publish the narrowest folder, and never
+  to print credentials.
+
+## Making it an Omarchy default
+
+If Omarchy wanted this out of the box, the changes upstream would be small:
+
+1. **CLI:** add `omarchy-mise-install npm:spacefast sf` to `install/user/mise.sh`.
+2. **Menu:** add the `trigger.share.web.*` entries from [`share/menu.jsonc`](share/menu.jsonc) to
+   `default/omarchy/omarchy-menu.jsonc`, and ship `bin/omarchy-spacefast` as a regular
+   `omarchy-*` command.
+3. **Skill:** add `skill/omarchy-spacefast` under `default/agents/skills/`, with a migration that
+   links it the way the `omarchy` skill is linked.
+4. **Widget:** keep it third-party, installable with `omarchy plugin add`, or ship it disabled.
+
+## License
+
+MIT

@@ -1,0 +1,8 @@
+  // >>> omarchy-spacefast (managed by omarchy-spacefast; remove with its uninstaller)
+  "trigger.share.web": {"icon":"󰖟","label":"Web","description":"Publish to a live URL with Spacefast"},
+  "trigger.share.web.file": {"icon":"","label":"File","description":"Publish files and copy a link","action":"omarchy-spacefast publish file"},
+  "trigger.share.web.folder": {"icon":"","label":"Folder","description":"Publish a folder or built site and copy a link","action":"omarchy-spacefast publish folder"},
+  "trigger.share.web.clipboard": {"icon":"","label":"Clipboard","description":"Publish text, HTML, or an image from the clipboard","action":"omarchy-spacefast publish clipboard"},
+  "trigger.share.web.spaces": {"icon":"󰕰","label":"My Spaces","description":"Your published spaces","action":"omarchy-spacefast panel"},
+  "trigger.share.web.login": {"icon":"󰍂","label":"Sign in","description":"Keep spaces and share links with your WordPress.com account","action":"omarchy-spacefast login"},
+  // <<< omarchy-spacefast
