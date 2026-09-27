@@ -1,7 +1,14 @@
 # Spacefast bar widget for Omarchy
 
-A bar button for [Spacefast](https://spacefast.com). Click it to see your spaces, and publish
-something new in two clicks.
+**An SF in your bar.** A bar button for [Spacefast](https://spacefast.com). Click it to see
+your spaces, and publish something new in two clicks.
+
+[![omarchy × spacefast: Tile it. Ship it.](https://raw.githubusercontent.com/alansmodic/omarchy-spacefast/main/docs/banner.png)](https://spacearchy.view.fast/)
+
+**[See it live at spacearchy.view.fast →](https://spacearchy.view.fast/)** That page was
+published with the same tool. The widget is one of three pieces: for the Omarchy menu entry
+(Share → Web) and the agent skill ("put this online"), see
+[omarchy-spacefast](https://github.com/alansmodic/omarchy-spacefast).
 
 - **Left click:** the panel. It lists your recent publishes (and your account's spaces when
   signed in). From there you can:

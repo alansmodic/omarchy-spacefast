@@ -1,8 +1,27 @@
 # omarchy-spacefast
 
-Put things on the web from [Omarchy](https://omarchy.org) with
-[Spacefast](https://spacefast.com). You pick a file, folder, or the clipboard, get a live URL,
-and a link goes on your clipboard. No account is needed for the first publish.
+**Tile it. Ship it.** Put things on the web from [Omarchy](https://omarchy.org) with
+[Spacefast](https://spacefast.com).
+
+[![omarchy × spacefast: Tile it. Ship it.](docs/banner.png)](https://spacearchy.view.fast/)
+
+**[See it live at spacearchy.view.fast →](https://spacearchy.view.fast/)** That page is itself a
+Spacefast space, published from an Omarchy machine with `omarchy-spacefast publish ./site`.
+Press `t` there to try it in every Omarchy theme.
+
+Your desktop already moves at keyboard speed. Now anything on it goes live on the web in one
+move: a file, a folder, a built site, or whatever is on your clipboard. The link lands on your
+clipboard, a notification tells you it's up, and the SF in your bar keeps track of it.
+**No account is needed for the first publish.**
+
+- **Omarchy-shaped.** It lives in the menu you already use, the bar you already look at, and
+  the terminal you already live in. It even wears your theme (the lime stays).
+- **Safe by default.** Spaces start private. Claim keys are stored mode 600 and never printed.
+  `.env*`, `.git`, and `node_modules` never leave your machine.
+- **Plain and inspectable.** One bash script with `jq` and `curl`. No daemon. The uninstaller
+  removes exactly what the installer added.
+- **Real hosting.** Spacefast runs on WordPress.com infrastructure. Every publish is an
+  immutable version, and republishing updates the same space instead of making a new one.
 
 There are three pieces. Install them together or one at a time:
 
@@ -16,6 +35,8 @@ All three share one small command, [`omarchy-spacefast`](bin/omarchy-spacefast),
 the publishing.
 
 ## Install
+
+Thirty seconds to your first link.
 
 ```bash
 git clone https://github.com/alansmodic/omarchy-spacefast.git omarchy-spacefast && cd omarchy-spacefast
