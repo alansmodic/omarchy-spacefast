@@ -18,7 +18,7 @@ the publishing.
 ## Install
 
 ```bash
-git clone <this repo> omarchy-spacefast && cd omarchy-spacefast
+git clone https://github.com/alansmodic/omarchy-spacefast.git omarchy-spacefast && cd omarchy-spacefast
 ./install.sh                 # everything
 ./install.sh share skill     # only the pieces you name: share, plugin, skill
 ./install.sh --uninstall     # remove everything (or: ./install.sh plugin --uninstall)
@@ -31,7 +31,7 @@ pass one along without the rest.
 The bar widget can also live in its own repository, since Omarchy installs plugins from git:
 
 ```bash
-omarchy plugin add https://github.com/<owner>/omarchy-spacefast-plugin.git --enable
+omarchy plugin add https://github.com/alansmodic/omarchy-spacefast-plugin.git --enable
 ```
 
 `scripts/build-dist.sh` writes that repository's contents to `dist/omarchy-spacefast-plugin/`.

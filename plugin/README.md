@@ -25,7 +25,7 @@ opens, and a stray keystroke should never publish anything.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/<owner>/omarchy-spacefast-plugin.git --enable
+omarchy plugin add https://github.com/alansmodic/omarchy-spacefast-plugin.git --enable
 # or, from a checkout of this folder:
 ./install.sh
 ```
