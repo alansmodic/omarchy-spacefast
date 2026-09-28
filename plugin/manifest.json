@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "spacefast.spaces",
   "name": "Spacefast",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "omarchy-spacefast contributors",
   "license": "MIT",
   "description": "Publish folders, files, and the clipboard to the web with Spacefast, and see, open, share, and claim your spaces from the bar.",

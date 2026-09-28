@@ -53,10 +53,12 @@ Before a folder publish:
 
 Prefer `omarchy-spacefast` when it is installed (`command -v omarchy-spacefast`). It:
 
-- picks the best engine: `sf`, then `npx spacefast`, then plain curl
+- publishes over the Spacefast HTTP API with curl (or through `sf` when only `sf` is signed in)
 - remembers which space each path went to, so republishing updates the same space
 - copies the link to the clipboard and sends a desktop notification
-- stores claim keys privately in `~/.local/state/omarchy-spacefast/` (mode 600)
+- keeps space keys and preview links out of its state file: in the macOS Keychain, or in
+  `~/.local/state/omarchy-spacefast/secrets.json` (mode 600) on Linux
+- runs on Linux and macOS
 
 ```bash
 omarchy-spacefast publish ./dist --json              # a folder or built site
@@ -95,8 +97,9 @@ Keep the report short:
   - Say the space is private and that a private preview link is on their clipboard for them
     alone.
   - Say it expires at `claimExpiresAt` (about 33 hours) unless claimed.
-  - To keep it and get a shareable link, they claim it: `omarchy-spacefast claim <spaceId>`
-    opens the claim page. Claiming signs them in with WordPress.com.
+  - To keep it and get a shareable link, they claim it: `omarchy-spacefast claim <spaceId>`.
+    When they are signed in (`omarchy-spacefast login`) that moves it into their account
+    directly; otherwise it opens the claim page, which signs them in with WordPress.com.
 - A `403` on the live URL of a private space is expected. It does not mean the publish failed.
 
 Never print, paste, or log a claim key (`sfc_…`), the anonymous preview URL (it contains the
@@ -108,8 +111,9 @@ claim key), API keys, or `.spacefast/state.json`. All of these carry management 
 omarchy-spacefast spaces --json     # recent publishes from this machine, plus account spaces when signed in
 omarchy-spacefast copy <spaceId>    # copy the best link to share (creates a viewer share link when signed in)
 omarchy-spacefast open <spaceId>    # open in the browser (signed-in session for private spaces)
-omarchy-spacefast claim <spaceId>   # claim page for an anonymous space
+omarchy-spacefast claim <spaceId>   # move an anonymous space into the account (or open its claim page)
 omarchy-spacefast login             # sign in; publishes are then kept, not temporary
+omarchy-spacefast team <slug>       # pick the team new spaces go to (required with several teams)
 ```
 
 On the desktop, the same things are available from **Omarchy menu → Trigger → Share → Web**

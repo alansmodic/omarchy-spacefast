@@ -93,7 +93,7 @@ install_sf_cli() {
     rm -f "$HOME/.local/bin/sf"
     echo "Could not install the sf command through mise:" >&2
     grep -m1 -iE 'error|trust' <<<"$out" | sed 's/^/  /' >&2 || true
-    echo "Publishing still works (npx spacefast, or curl without Node)." >&2
+    echo "Publishing still works: omarchy-spacefast talks to the Spacefast API with curl." >&2
   fi
 }
 
