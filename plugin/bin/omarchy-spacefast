@@ -1,36 +1,52 @@
 #!/bin/bash
 
 # omarchy:summary=Publish files, folders, or the clipboard to the web with Spacefast
-# omarchy:args=<publish|spaces|open|copy|claim|login|status|panel> [args...]
+# omarchy:args=<publish|spaces|open|copy|claim|login|logout|team|status|panel> [args...]
 # omarchy:examples=omarchy-spacefast publish folder | omarchy-spacefast publish ~/report.html | omarchy-spacefast spaces --json
 
-# One engine shared by the Omarchy share menu, the Spacefast bar widget, and the
-# agent skill. Publishing goes through the `sf` CLI when it is available (or
-# `npx spacefast` when Node is), and falls back to a single anonymous curl
-# upload when neither is, so a fresh install can publish with nothing extra.
+# One engine shared by the Omarchy share menu, the Spacefast bar widget, the
+# agent skill, and the Alfred workflow (which bundles this file). It runs on
+# Linux and macOS with bash 3.2 or later, curl, and jq.
 #
-# Local state lives in $XDG_STATE_HOME/omarchy-spacefast/spaces.json (mode
-# 600). It holds claim keys for anonymous spaces, so it is never printed:
-# `spaces --json` returns only non-secret fields.
+# Publishing talks to the Spacefast HTTP API directly. Sign in with `login`
+# (the same device flow as `sf login`) to publish to your account; without
+# it, publishes are anonymous and expire unless claimed. When you are not
+# signed in here but the `sf` CLI is, publishing goes through `sf` as before.
+#
+# Non-secret state lives in spaces.json. Space keys, private preview links,
+# and the account API key are secrets: they go to the macOS Keychain, or on
+# Linux to secrets.json (mode 600). None of them is ever printed.
 
 set -euo pipefail
 
-VERSION="0.1.0"
-STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-spacefast"
+VERSION="0.2.0"
+OS=$(uname -s)
+if [[ $OS == Darwin ]]; then
+  DEFAULT_STATE="$HOME/Library/Application Support/spacefast-desktop"
+else
+  DEFAULT_STATE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-spacefast"
+fi
+STATE_DIR="${SPACEFAST_STATE_DIR:-$DEFAULT_STATE}"
 SPACES_FILE="$STATE_DIR/spaces.json"
+ACCOUNT_FILE="$STATE_DIR/account.json"
+SECRETS_FILE="$STATE_DIR/secrets.json"
+KEYCHAIN_SERVICE="${SPACEFAST_KEYCHAIN_SERVICE:-Spacefast Desktop}"
+# keychain (macOS default) or file (Linux default; mode 600)
+SECRET_STORE="${SPACEFAST_SECRETS:-$([[ $OS == Darwin ]] && echo keychain || echo file)}"
 DASHBOARD_URL="https://my.spacefast.com"
 API_URL="${SPACEFAST_API_URL:-https://api.spacefast.com}"
 PLUGIN_ID="spacefast.spaces"
-CLIENT_HEADER="x-spacefast-client: omarchy/share"
+CLIENT_HEADER="x-spacefast-client: ${SPACEFAST_CLIENT:-omarchy/share}"
+SHARE_LINK_NAME="Desktop share"
 EMPTY_JSON="{}"
-SELF=$(realpath "$0" 2>/dev/null || echo omarchy-spacefast)
+SELF=$(realpath "$0" 2>/dev/null || echo "$0")
 
-# link: logged-in publishes get a viewer share link (default)
-# public: new logged-in spaces are public
+# link: signed-in publishes get a viewer share link (default)
+# public: new signed-in spaces are public
 # private: only you (and people you invite) can open it
-ACCESS="${OMARCHY_SPACEFAST_ACCESS:-link}"
+ACCESS="${OMARCHY_SPACEFAST_ACCESS:-${SPACEFAST_ACCESS:-link}}"
 
-NOTIFY=1
+NOTIFY="${SPACEFAST_NOTIFY:-1}"
 COPY=1
 JSON=0
 FORCE_NEW=0
@@ -38,9 +54,10 @@ TMP_DIRS=()
 
 cleanup() {
   local dir
-  for dir in "${TMP_DIRS[@]}"; do
+  for dir in ${TMP_DIRS[@]+"${TMP_DIRS[@]}"}; do
     [[ -n $dir && -d $dir ]] && rm -rf "$dir"
   done
+  return 0
 }
 trap cleanup EXIT
 
@@ -49,21 +66,23 @@ usage() {
 Usage: omarchy-spacefast <command> [args...]
 
 Commands:
-  publish <clipboard|file|folder|PATH...>   Publish and copy a link
+  publish <clipboard|file|folder|-|PATH...>  Publish and copy a link (- reads text from stdin)
       --new                    Create a new space instead of updating the last one for this path
       --access link|public|private
                                What to do for signed-in publishes (default: link)
       --title <title>          Title for a new space
-      --team <slug>            Team for a new space (default: your sf default team)
-      --message <text>         Changelog entry for this version
+      --team <slug>            Team for a new space (default: the one set with `team`)
+      --message <text>         Changelog entry for this version (sf engine)
       --json                   Print a JSON summary (no secrets)
       --no-notify, --no-copy   Skip the desktop notification / clipboard copy
-  spaces [--json]              Recent publishes plus your account's spaces
-  open <space-id>              Open a space in the browser
+  spaces [--json]              Spaces published here, plus your account's spaces when signed in
+  open <space-id>              Open a space in the browser (signed in for private spaces)
   copy <space-id>              Copy the best link to share (creates a share link if needed)
-  claim <space-id>             Open the claim page for an anonymous space
-  login                        Sign in with your WordPress.com account
-  status [--json]              Show which engine is used and whether you are signed in
+  claim <space-id> [--browser] Move an anonymous space into your account, or open its claim page
+  login [--sf]                 Sign in with your WordPress.com account (--sf: through the sf CLI)
+  logout                       Sign out here and revoke this machine's key
+  team [slug|id] [--json]      Show your teams, or pick the one new spaces go to
+  status [--json]              Show the engine, account, and team
   panel                        Toggle the bar panel, or open the dashboard
 EOF
 }
@@ -73,30 +92,69 @@ EOF
 
 say() { ((JSON)) || echo "$@" >&2; }
 
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# notify [-u critical] TITLE [BODY] [--exec ...]
 notify() {
   ((NOTIFY)) || return 0
+  local urgency=()
+  if [[ ${1:-} == -u ]]; then
+    urgency=(-u "$2")
+    shift 2
+  fi
+  local title="$1" body="${2:-}"
   if command -v omarchy-notification-send >/dev/null 2>&1; then
-    omarchy-notification-send -g "󰖟" "$@" >/dev/null 2>&1 || true
+    omarchy-notification-send -g "󰖟" ${urgency[@]+"${urgency[@]}"} "$@" >/dev/null 2>&1 || true
   elif command -v notify-send >/dev/null 2>&1; then
-    notify-send "$1" "${2:-}" >/dev/null 2>&1 || true
+    notify-send ${urgency[@]+"${urgency[@]}"} "$title" "$body" >/dev/null 2>&1 || true
+  elif [[ $OS == Darwin ]]; then
+    osascript - "$title" "$body" >/dev/null 2>&1 <<'EOF' || true
+on run argv
+  display notification (item 2 of argv) with title (item 1 of argv)
+end run
+EOF
   fi
 }
 
 fail() {
   echo "omarchy-spacefast: $*" >&2
-  NOTIFY=$NOTIFY notify -u critical "Could not publish" "$*"
+  notify -u critical "Could not publish" "$*"
   exit 1
 }
 
 copy_text() {
   ((COPY)) || return 0
-  if command -v wl-copy >/dev/null 2>&1; then
+  if [[ $OS == Darwin ]]; then
+    printf '%s' "$1" | pbcopy
+  elif command -v wl-copy >/dev/null 2>&1; then
     printf '%s' "$1" | wl-copy >/dev/null 2>&1 || true
+  elif command -v xclip >/dev/null 2>&1; then
+    printf '%s' "$1" | xclip -selection clipboard >/dev/null 2>&1 || true
+  fi
+}
+
+# Copies a link that carries management rights. On macOS it is marked
+# concealed, so clipboard history (Alfred, Raycast, Maccy) does not keep it.
+copy_secret() {
+  ((COPY)) || return 0
+  if [[ $OS == Darwin ]]; then
+    printf '%s' "$1" | osascript -l JavaScript -e '
+      ObjC.import("AppKit");
+      const data = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
+      const text = $.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding);
+      const pb = $.NSPasteboard.generalPasteboard;
+      pb.clearContents;
+      pb.setStringForType(text, $.NSPasteboardTypeString);
+      pb.setStringForType("", "org.nspasteboard.ConcealedType");' >/dev/null 2>&1 || printf '%s' "$1" | pbcopy
+  else
+    copy_text "$1"
   fi
 }
 
 open_url() {
-  if command -v omarchy-launch-browser >/dev/null 2>&1; then
+  if [[ $OS == Darwin ]]; then
+    open "$1"
+  elif command -v omarchy-launch-browser >/dev/null 2>&1; then
     omarchy-launch-browser "$1" >/dev/null 2>&1 &
   else
     xdg-open "$1" >/dev/null 2>&1 &
@@ -107,42 +165,38 @@ need() {
   command -v "$1" >/dev/null 2>&1 || fail "$1 is required"
 }
 
-# Resolve the CLI: an installed `sf` first (Omarchy ships it as a mise
-# wrapper), then npx, else nothing and publishing falls back to curl.
-SF=()
-resolve_sf() {
-  # OMARCHY_SPACEFAST_ENGINE=curl forces the no-install path.
-  [[ ${OMARCHY_SPACEFAST_ENGINE:-} == curl ]] && return 0
-  if command -v sf >/dev/null 2>&1; then
-    SF=(sf)
-  elif command -v npx >/dev/null 2>&1; then
-    SF=(npx -y --quiet spacefast)
-  fi
+# ISO 8601 (with or without fractional seconds) to epoch seconds, 0 if unparseable.
+epoch() {
+  [[ -n ${1:-} ]] || { echo 0; return; }
+  jq -rn --arg d "$1" '$d | sub("\\.[0-9]+"; "") | fromdateiso8601' 2>/dev/null || echo 0
 }
 
-engine_name() {
-  if ((${#SF[@]} == 0)); then
-    echo curl
-  elif [[ ${SF[0]} == sf ]]; then
-    echo sf
-  else
-    echo npx
-  fi
-}
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
-signed_in() {
-  ((${#SF[@]})) || return 1
-  [[ -n ${SPACEFAST_TOKEN:-} ]] && return 0
-  "${SF[@]}" status --json 2>/dev/null | jq -e '.data.authenticated == true' >/dev/null 2>&1
+relative_until() {
+  local diff=$(($(epoch "${1:-}") - $(date +%s)))
+  if ((diff <= 0)); then echo "0m"
+  elif ((diff >= 3600)); then echo "$((diff / 3600))h"
+  else echo "$((diff / 60))m"
+  fi
 }
 
 # ---------------------------------------------------------------------------
-# State
+# State and secrets
 
 state_init() {
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
   [[ -f $SPACES_FILE ]] || (umask 077 && echo '{}' >"$SPACES_FILE")
+  migrate_secrets
+}
+
+write_json() {
+  local file="$1" tmp
+  tmp=$(mktemp "$STATE_DIR/.state.XXXXXX")
+  cat >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$file"
 }
 
 state_get() {
@@ -159,19 +213,164 @@ state_find_source() {
 
 # Merge a JSON object into the record for a space.
 state_put() {
-  local id="$1" record="$2" tmp
-  tmp=$(mktemp "$STATE_DIR/.spaces.XXXXXX")
-  jq --arg id "$id" --argjson rec "$record" '.[$id] = ((.[$id] // {}) + $rec)' "$SPACES_FILE" >"$tmp"
-  chmod 600 "$tmp"
-  mv "$tmp" "$SPACES_FILE"
+  jq --arg id "$1" --argjson rec "$2" '.[$id] = ((.[$id] // {}) + $rec)' "$SPACES_FILE" | write_json "$SPACES_FILE"
 }
 
 state_drop() {
-  local tmp
-  tmp=$(mktemp "$STATE_DIR/.spaces.XXXXXX")
-  jq --arg id "$1" 'del(.[$id])' "$SPACES_FILE" >"$tmp"
-  chmod 600 "$tmp"
-  mv "$tmp" "$SPACES_FILE"
+  jq --arg id "$1" 'del(.[$id])' "$SPACES_FILE" | write_json "$SPACES_FILE"
+  secret_del "$1"
+}
+
+# Secrets are one compact JSON object per name: a space id holds
+# {claimKey, previewUrl, claimUrl}; "session" holds {apiKey, apiKeyId}.
+secret_get() {
+  if [[ $SECRET_STORE == keychain ]]; then
+    local b64
+    b64=$(security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$1" -w 2>/dev/null) || return 0
+    printf '%s' "$b64" | base64 -D 2>/dev/null || true
+  else
+    [[ -f $SECRETS_FILE ]] && jq -c --arg n "$1" '.[$n] // empty' "$SECRETS_FILE" 2>/dev/null
+    return 0
+  fi
+}
+
+secret_put() {
+  local name="$1" value="$2"
+  if [[ $SECRET_STORE == keychain ]]; then
+    # Fed through stdin so the secret never appears in a process listing.
+    local b64
+    b64=$(printf '%s' "$value" | base64 | tr -d '\n')
+    printf 'add-generic-password -U -s "%s" -a "%s" -w "%s"\n' "$KEYCHAIN_SERVICE" "$name" "$b64" |
+      security -i >/dev/null 2>&1 || fail "Could not save to the Keychain"
+  else
+    [[ -f $SECRETS_FILE ]] || (umask 077 && echo '{}' >"$SECRETS_FILE")
+    jq --arg n "$name" --argjson v "$value" '.[$n] = $v' "$SECRETS_FILE" | write_json "$SECRETS_FILE"
+  fi
+}
+
+secret_del() {
+  if [[ $SECRET_STORE == keychain ]]; then
+    security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$1" >/dev/null 2>&1 || true
+  elif [[ -f $SECRETS_FILE ]]; then
+    jq --arg n "$1" 'del(.[$n])' "$SECRETS_FILE" | write_json "$SECRETS_FILE"
+  fi
+}
+
+# Version 0.1 kept space keys and preview links in spaces.json. Move them out
+# so the state file the bar widget watches holds nothing secret.
+migrate_secrets() {
+  jq -e 'any(.[]; has("claimKey") or has("previewUrl") or has("claimUrl"))' "$SPACES_FILE" >/dev/null 2>&1 || return 0
+  local id secret
+  while IFS= read -r id; do
+    secret=$(jq -c --arg id "$id" '.[$id] | {claimKey, previewUrl, claimUrl} | with_entries(select(.value != null))' "$SPACES_FILE")
+    [[ $secret != "{}" ]] && secret_put "$id" "$secret"
+  done < <(jq -r 'to_entries[] | select(.value | has("claimKey") or has("previewUrl") or has("claimUrl")) | .key' "$SPACES_FILE")
+  jq 'map_values(del(.claimKey, .previewUrl, .claimUrl))' "$SPACES_FILE" | write_json "$SPACES_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# Account
+
+# The account API key: SPACEFAST_TOKEN, else the one `login` saved.
+TOKEN=""
+load_token() {
+  if [[ -n ${SPACEFAST_TOKEN:-} ]]; then
+    TOKEN="$SPACEFAST_TOKEN"
+  else
+    TOKEN=$(secret_get session | jq -r '.apiKey // empty' 2>/dev/null || true)
+  fi
+}
+
+account_get() {
+  [[ -f $ACCOUNT_FILE ]] && jq -c . "$ACCOUNT_FILE" 2>/dev/null || echo '{}'
+}
+
+# Team id for new spaces: --team / SPACEFAST_TEAM (slug or id), else the saved default.
+team_id() {
+  local want="${SPACEFAST_TEAM:-}"
+  if [[ -n $want ]]; then
+    account_get | jq -r --arg t "$want" '(.teams // [])[] | select(.slug == $t or .id == $t) | .id' | head -1
+  else
+    account_get | jq -r '.team.id // empty'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# HTTP
+
+API_STATUS=0
+API_BODY=""
+# api METHOD ROUTE [BEARER] [JSON_BODY]; sets API_STATUS and API_BODY.
+api() {
+  local method="$1" route="$2" bearer="${3:-}" body="${4:-}" out args=()
+  args=(-q -sS --max-time 60 -X "$method" -H "$CLIENT_HEADER" -w '\n%{http_code}')
+  [[ -n $bearer ]] && args+=(-H "Authorization: Bearer $bearer")
+  [[ -n $body ]] && args+=(-H "Content-Type: application/json" --data-binary "$body")
+  out=$(curl "${args[@]}" "$API_URL$route") || { API_STATUS=0; API_BODY=""; return 1; }
+  API_STATUS=${out##*$'\n'}
+  API_BODY=${out%$'\n'*}
+  [[ $API_STATUS == 2* ]]
+}
+
+# The message of a Spacefast problem document, with its request id.
+api_error() {
+  local fallback="${1:-Spacefast returned HTTP $API_STATUS}"
+  [[ $API_STATUS == 0 ]] && { echo "Could not reach Spacefast"; return; }
+  jq -r --arg f "$fallback" '
+    ((.detail // .error.message // .title // $f)
+     + (if .requestId then " (request \(.requestId))" else "" end))' 2>/dev/null <<<"$API_BODY" || echo "$fallback"
+}
+
+claim_status() {
+  api GET /v1/claim/status "$1" && jq -c '.data.claim' <<<"$API_BODY"
+}
+
+# A viewer link for the whole space: reuses one this tool made, else creates one.
+share_link_for() {
+  local id="$1" url=""
+  if api GET "/v1/spaces/$id/share-links" "$TOKEN"; then
+    url=$(jq -r --arg n "$SHARE_LINK_NAME" '[.data[]? | select(.name == $n and .url and (.active != false) and (.revokedAt == null))][0].url // empty' <<<"$API_BODY")
+  fi
+  if [[ -z $url ]]; then
+    api POST "/v1/spaces/$id/share-links" "$TOKEN" "$(jq -nc --arg n "$SHARE_LINK_NAME" '{name: $n, resources: {include: ["/**"]}}')" || return 1
+    url=$(jq -r '.data.url // empty' <<<"$API_BODY")
+  fi
+  [[ -n $url ]] && echo "$url"
+}
+
+# ---------------------------------------------------------------------------
+# The sf CLI, used only when you are signed in there and not here.
+
+SF=()
+resolve_sf() {
+  local engine=${OMARCHY_SPACEFAST_ENGINE:-${SPACEFAST_ENGINE:-}}
+  [[ $engine == curl ]] && return 0
+  if command -v sf >/dev/null 2>&1; then
+    SF=(sf)
+  elif [[ $engine == sf ]] && command -v npx >/dev/null 2>&1; then
+    # Only on request: npx fetches the package, too slow to probe every run.
+    SF=(npx -y --quiet spacefast)
+  fi
+  return 0
+}
+
+sf_signed_in() {
+  ((${#SF[@]})) || return 1
+  "${SF[@]}" status --json 2>/dev/null | jq -e '.data.authenticated == true' >/dev/null 2>&1
+}
+
+# ENGINE: api (signed in here), sf (signed in through sf), or anonymous.
+ENGINE=""
+resolve_engine() {
+  load_token
+  resolve_sf
+  if [[ -n $TOKEN ]]; then
+    ENGINE=api
+  elif [[ ${OMARCHY_SPACEFAST_ENGINE:-${SPACEFAST_ENGINE:-}} == sf ]] || { ((${#SF[@]})) && sf_signed_in; }; then
+    ENGINE=sf
+  else
+    ENGINE=anonymous
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -211,15 +410,16 @@ EOF
 
 # Writes an index.html that presents arbitrary files in $1.
 write_index() {
-  local root="$1" title="$2" name esc
+  local root="$1" title="$2" name esc f files
+  shopt -s nullglob
+  files=("$root"/*)
+  shopt -u nullglob
   {
     page_head "$title"
-    shopt -s nullglob
-    local files=("$root"/*)
     if ((${#files[@]} == 1)); then
       name=$(basename "${files[0]}")
       esc=$(printf '%s' "$name" | html_escape)
-      case "${name,,}" in
+      case "$(lower "$name")" in
       *.png | *.jpg | *.jpeg | *.gif | *.webp | *.svg | *.avif) echo "<img src=\"$esc\" alt=\"$esc\">" ;;
       *.mp4 | *.webm | *.mov) echo "<video src=\"$esc\" controls></video>" ;;
       *.pdf) echo "<iframe src=\"$esc\" title=\"$esc\"></iframe>" ;;
@@ -227,16 +427,16 @@ write_index() {
       esac
     fi
     echo "<ul>"
-    local f
-    for f in "${files[@]}"; do
+    for f in ${files[@]+"${files[@]}"}; do
       name=$(basename "$f")
       [[ $name == index.html ]] && continue
       esc=$(printf '%s' "$name" | html_escape)
-      echo "<li><a href=\"$esc\">$esc</a> <small>$(du -h "$f" | cut -f1)</small></li>"
+      echo "<li><a href=\"$esc\">$esc</a> <small>$(du -h "$f" | cut -f1 | tr -d ' ')</small></li>"
     done
     echo "</ul>"
     echo "</main>"
-  } >"$root/index.html"
+  } >"$root/index.html.tmp"
+  mv "$root/index.html.tmp" "$root/index.html"
 }
 
 new_tmp_root() {
@@ -251,58 +451,108 @@ ROOT=""
 TITLE=""
 SOURCE=""
 
+text_page() {
+  local title="$1" text="$2"
+  if grep -qiE '^[[:space:]]*(<!doctype html|<html)' <<<"$text"; then
+    printf '%s\n' "$text"
+  else
+    page_head "$title"
+    echo "<pre>"
+    printf '%s\n' "$text" | html_escape
+    echo "</pre></main>"
+  fi
+}
+
 prepare_clipboard() {
-  need wl-paste
   ROOT=$(new_tmp_root)
   SOURCE=""
   TITLE="Clipboard $(date '+%Y-%m-%d %H:%M')"
-  local types
+  if [[ $OS == Darwin ]]; then
+    prepare_clipboard_macos
+  else
+    prepare_clipboard_wayland
+  fi
+}
+
+prepare_stdin() {
+  local text
+  text=$(cat)
+  [[ -n ${text//[[:space:]]/} ]] || fail "Nothing to publish"
+  ROOT=$(new_tmp_root)
+  SOURCE=""
+  TITLE="Text $(date '+%Y-%m-%d %H:%M')"
+  text_page "$TITLE" "$text" >"$ROOT/index.html"
+}
+
+prepare_clipboard_macos() {
+  local info file text
+  info=$(osascript -e 'clipboard info' 2>/dev/null || true)
+  # A file copied in Finder publishes that file.
+  if grep -q 'furl' <<<"$info"; then
+    file=$(osascript -e 'POSIX path of (the clipboard as «class furl»)' 2>/dev/null || true)
+    if [[ -n $file && -e $file ]]; then
+      prepare_paths "$file"
+      SOURCE=""
+      return
+    fi
+  fi
+  if grep -q 'PNGf' <<<"$info"; then
+    osascript - "$ROOT/image.png" >/dev/null <<'EOF' || fail "Could not read the image on the clipboard"
+on run argv
+  set f to open for access (POSIX file (item 1 of argv)) with write permission
+  write (the clipboard as «class PNGf») to f
+  close access f
+end run
+EOF
+    write_index "$ROOT" "$TITLE"
+    return
+  fi
+  text=$(pbpaste 2>/dev/null || true)
+  [[ -n ${text//[[:space:]]/} ]] || fail "The clipboard is empty"
+  text_page "$TITLE" "$text" >"$ROOT/index.html"
+}
+
+prepare_clipboard_wayland() {
+  need wl-paste
+  local types type ext text
   types=$(wl-paste --list-types 2>/dev/null || true)
   [[ -n $types ]] || fail "The clipboard is empty"
-
   if grep -q '^image/png$' <<<"$types"; then
     wl-paste --type image/png >"$ROOT/image.png"
     write_index "$ROOT" "$TITLE"
   elif grep -q '^image/' <<<"$types"; then
-    local type ext
     type=$(grep -m1 '^image/' <<<"$types")
     ext=${type#image/}
     ext=${ext%%+*}
     wl-paste --type "$type" >"$ROOT/image.$ext"
     write_index "$ROOT" "$TITLE"
   else
-    local text
     text=$(wl-paste --no-newline 2>/dev/null || true)
     [[ -n ${text//[[:space:]]/} ]] || fail "The clipboard is empty"
-    if grep -qiE '^[[:space:]]*(<!doctype html|<html)' <<<"$text"; then
-      printf '%s\n' "$text" >"$ROOT/index.html"
-    else
-      { page_head "$TITLE"; echo "<pre>"; printf '%s\n' "$text" | html_escape; echo "</pre></main>"; } >"$ROOT/index.html"
-    fi
+    text_page "$TITLE" "$text" >"$ROOT/index.html"
   fi
 }
 
 prepare_paths() {
-  local paths=("$@") p
-  for p in "${paths[@]}"; do
+  local p file
+  for p in "$@"; do
     [[ -e $p ]] || fail "No such file or folder: $p"
   done
 
-  if ((${#paths[@]} == 1)) && [[ -d ${paths[0]} ]]; then
-    ROOT=$(realpath "${paths[0]}")
+  if (($# == 1)) && [[ -d $1 ]]; then
+    ROOT=$(realpath "$1")
     SOURCE="$ROOT"
     TITLE=$(basename "$ROOT")
     return
   fi
 
   ROOT=$(new_tmp_root)
-  if ((${#paths[@]} == 1)); then
-    local file
-    file=$(realpath "${paths[0]}")
+  if (($# == 1)); then
+    file=$(realpath "$1")
     SOURCE="$file"
     TITLE=$(basename "$file")
     TITLE=${TITLE%.*}
-    case "${file,,}" in
+    case "$(lower "$file")" in
     *.html | *.htm)
       cp -- "$file" "$ROOT/index.html"
       return
@@ -311,16 +561,17 @@ prepare_paths() {
     cp -- "$file" "$ROOT/"
   else
     SOURCE=""
-    TITLE="$(basename "$(realpath "${paths[0]}")") and $((${#paths[@]} - 1)) more"
-    for p in "${paths[@]}"; do
-      cp -r -- "$p" "$ROOT/"
+    TITLE="$(basename "$(realpath "$1")") and $(($# - 1)) more"
+    for p in "$@"; do
+      cp -R -- "$p" "$ROOT/"
     done
   fi
   write_index "$ROOT" "$TITLE"
 }
 
+PICKED=()
 pick_paths() {
-  local mode="$1" picked status=0 select_args
+  local mode="$1" picked status=0 select_args line
   command -v omarchy-file-select >/dev/null 2>&1 || fail "Pass a path to publish"
   if [[ $mode == folder ]]; then
     select_args=(--title "Publish folder to the web" --directory)
@@ -330,16 +581,49 @@ pick_paths() {
   picked=$(omarchy-file-select "${select_args[@]}") || status=$?
   ((status <= 1)) || fail "The file chooser did not open"
   [[ -n $picked ]] || exit 0
-  mapfile -t PICKED <<<"$picked"
+  while IFS= read -r line; do
+    [[ -n $line ]] && PICKED+=("$line")
+  done <<<"$picked"
 }
 
-# Warn about secrets in a folder publish. `sf publish` already skips dotenv
-# files and anything .gitignore'd; the curl path excludes them explicitly.
+# The files to upload from $1, one relative path per line. Inside a git work
+# tree that is what git tracks or would track (so .gitignore applies);
+# otherwise every regular file. Dotenv files, .git, node_modules, .spacefast,
+# .DS_Store, and symlinks are always left out.
+list_files() {
+  local root="$1" rel base
+  {
+    if git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      (cd "$root" && git -c core.quotePath=false ls-files --cached --others --exclude-standard -- .)
+    else
+      (cd "$root" && find . \( -name .git -o -name node_modules -o -name .spacefast \) -prune -o -type f -print | sed 's#^\./##')
+    fi
+  } | while IFS= read -r rel; do
+    [[ -f $root/$rel && ! -L $root/$rel ]] || continue
+    case "/$rel/" in */.git/* | */node_modules/* | */.spacefast/*) continue ;; esac
+    base=${rel##*/}
+    case $base in .env* | .DS_Store) continue ;; esac
+    printf '%s\n' "$rel"
+  done
+}
+
+make_zip() {
+  local root="$1" zip="$2" list
+  list="$(dirname "$zip")/files.txt"
+  list_files "$root" >"$list"
+  [[ -s $list ]] || fail "Nothing to publish in $(basename "$root")"
+  if command -v bsdtar >/dev/null 2>&1; then
+    (cd "$root" && bsdtar --format zip -n -cf "$zip" -T "$list")
+  elif command -v zip >/dev/null 2>&1; then
+    (cd "$root" && zip -q -X "$zip" -@ <"$list")
+  else
+    fail "bsdtar or zip is required"
+  fi
+}
+
+# Dotenv files in a folder publish: always left out, and worth saying so.
 secret_warning() {
-  [[ -d $1 ]] || return 0
-  local found
-  found=$(find "$1" -maxdepth 3 -name '.env*' -not -path '*/node_modules/*' 2>/dev/null | head -3)
-  [[ -n $found ]] && echo "Left out .env files"
+  [[ -n $(find "$1" -name '.env*' -not -path '*/node_modules/*' 2>/dev/null | head -1) ]] && echo "Left out .env files"
   return 0
 }
 
@@ -356,16 +640,15 @@ publish_with_sf() {
     [[ -n $claim_key ]] && args+=(--claim-token "$claim_key")
   else
     args+=(--name "$TITLE")
-    [[ $ACCESS == public ]] && signed_in && args+=(--access public)
+    [[ $ACCESS == public ]] && args+=(--access public)
   fi
   [[ -n $message ]] && args+=(--message "$message")
 
-  local err out status=0
+  local err out status=0 detail="" doc
   err=$(mktemp)
   out=$(cd "$ROOT" && SPACEFAST_YES=1 "${SF[@]}" "${args[@]}" 2>"$err") || status=$?
   if ((status != 0)) || ! jq -e '.data.space.id' >/dev/null 2>&1 <<<"$out"; then
     # sf reports failures as a JSON problem document, on stdout or stderr.
-    local detail="" doc
     for doc in "$out" "$(cat "$err")"; do
       detail=$(jq -r '.error.message // .error.detail // .error.title // .detail // .title // empty' 2>/dev/null <<<"$doc" | head -1)
       [[ -n $detail ]] && break
@@ -378,53 +661,63 @@ publish_with_sf() {
   RECEIPT="$out"
 }
 
-# Zip the publish root. A zip that is already a website publishes as-is; a
-# tarball is treated as buildable source and queued to CI instead.
-make_zip() {
-  local root="$1" zip="$2"
-  local excludes=(--exclude '.env*' --exclude '.git' --exclude '.spacefast' --exclude 'node_modules' --exclude '.DS_Store')
-  if command -v bsdtar >/dev/null 2>&1; then
-    (cd "$root" && bsdtar --format zip "${excludes[@]}" -cf "$zip" .)
-  elif command -v zip >/dev/null 2>&1; then
-    (cd "$root" && zip -qr "$zip" . -x '.env*' '*/.env*' '.git/*' '*/.git/*' '.spacefast/*' '*/node_modules/*' '*.DS_Store')
-  else
-    fail "bsdtar or zip is required"
-  fi
-}
-
-publish_with_curl() {
-  local space_id="$1" claim_key="$2"
+# POST /v1/publish with a zip. The bearer is a space key when updating an
+# anonymous space, the account key when signed in, or nothing.
+publish_with_api() {
+  local space_id="$1" bearer="$2" team="$3"
   need curl
-  local zip out update=()
+  local zip payload out auth=()
   zip="$(new_tmp_root)/site.zip"
   make_zip "$ROOT" "$zip"
-  # Updating an anonymous space authenticates with its claim key.
-  if [[ -n $space_id && -n $claim_key ]]; then
-    update=(-H "Authorization: Bearer $claim_key" -F "payload={\"spaceId\":\"$space_id\"}")
+  if [[ -n $space_id ]]; then
+    payload=$(jq -nc --arg id "$space_id" '{spaceId: $id}')
+  else
+    payload=$(jq -nc --arg t "${TITLE:0:255}" --arg team "$team" --arg access "$ACCESS" --argjson owned "$([[ -n $bearer ]] && echo true || echo false)" '
+      {space: {title: $t}}
+      + (if $team != "" then {teamId: $team} else {} end)
+      + (if $owned and $access == "public" then {access: "public"} else {} end)')
   fi
-  out=$(curl -q -sS --max-time 300 -H "$CLIENT_HEADER" "${update[@]}" \
-    -F "archive=@$zip;type=application/zip" "$API_URL/v1/publish") || fail "Could not reach Spacefast"
+  [[ -n $bearer ]] && auth=(-H "Authorization: Bearer $bearer")
+  out=$(curl -q -sS --max-time 300 -H "$CLIENT_HEADER" ${auth[@]+"${auth[@]}"} \
+    --form-string "payload=$payload" -F "archive=@$zip;type=application/zip" "$API_URL/v1/publish") || fail "Could not reach Spacefast"
   if ! jq -e '.data.space.id' >/dev/null 2>&1 <<<"$out"; then
-    fail "$(jq -r '.detail // .title // "Publish failed"' 2>/dev/null <<<"$out")"
+    API_STATUS=400 API_BODY="$out"
+    if [[ -n $space_id && -n $bearer ]] && jq -e '.status == 401 or .status == 403' >/dev/null 2>&1 <<<"$out"; then
+      fail "Could not update this space. If you claimed it in the browser, run \`omarchy-spacefast login\` and publish again."
+    fi
+    fail "$(api_error "Publish failed")"
   fi
 
   # A receipt that still has work to do says so with next.action=poll.
-  local key tries=0 url wait polled
+  local key tries=0 url wait polled poll_auth=()
   key=$(jq -r '.data.claim.key // empty' <<<"$out")
-  [[ -n $key ]] || key="$claim_key"
+  [[ -n $key ]] || key="$bearer"
+  [[ -n $key ]] && poll_auth=(-H "Authorization: Bearer $key")
   while [[ $(jq -r '.data.next.action // "done"' <<<"$out") == poll ]] && ((tries++ < 90)); do
     url=$(jq -r '.data.next.url' <<<"$out")
     wait=$(jq -r '.data.next.retryAfter // 2' <<<"$out")
     sleep "$wait"
-    polled=$(curl -q -sS --max-time 30 -H "$CLIENT_HEADER" ${key:+-H "Authorization: Bearer $key"} "$API_URL$url") || continue
-    # Keep the claim block from the first receipt; polls do not repeat it.
-    out=$(jq -c --argjson first "$out" '.data.claim = (.data.claim // $first.data.claim) | .data.space = (.data.space // $first.data.space)' <<<"$polled")
+    polled=$(curl -q -sS --max-time 30 -H "$CLIENT_HEADER" ${poll_auth[@]+"${poll_auth[@]}"} "$API_URL$url") || continue
+    # Polls return the operation; keep the first receipt's space, claim, and version.
+    out=$(jq -c --argjson first "$out" '
+      .data.claim = (.data.claim // $first.data.claim)
+      | .data.space = (.data.space // $first.data.space)
+      | .data.version = (($first.data.version // {}) + (.data.version // {}))' <<<"$polled")
   done
+
+  local failed
+  failed=$(jq -r '[.data.build.status, .data.operation.status, .data.version.status][] | select(. == "failed" or . == "canceled" or . == "expired")' <<<"$out" | head -1)
+  [[ -z $failed ]] || fail "Publishing $failed"
   RECEIPT="$out"
 }
 
 create_share_link() {
   local space_id="$1" out
+  if [[ -n $TOKEN ]]; then
+    share_link_for "$space_id"
+    return
+  fi
+  ((${#SF[@]})) || return 1
   out=$("${SF[@]}" share link create --space "$space_id" --name "Omarchy share" --json --yes --show-secret 2>/dev/null) || return 1
   jq -r '.data.url // .data.link.url // empty' <<<"$out"
 }
@@ -443,6 +736,7 @@ cmd_publish() {
     --team) export SPACEFAST_TEAM="${2:?--team needs a value}"; shift ;;
     --message | -m) message="${2:?--message needs a value}"; shift ;;
     -h | --help) usage; exit 0 ;;
+    -) [[ -z $mode && ${#paths[@]} -eq 0 ]] && mode=stdin || paths+=("$1") ;;
     clipboard | file | folder)
       if [[ -z $mode && ${#paths[@]} -eq 0 && ! -e $1 ]]; then mode="$1"; else paths+=("$1"); fi
       ;;
@@ -454,107 +748,119 @@ cmd_publish() {
 
   need jq
   state_init
-  resolve_sf
+  resolve_engine
 
   if [[ $mode == clipboard ]]; then
     prepare_clipboard
+  elif [[ $mode == stdin ]]; then
+    prepare_stdin
   else
     if ((${#paths[@]} == 0)); then
-      PICKED=()
       pick_paths "${mode:-file}"
-      paths=("${PICKED[@]}")
+      paths=(${PICKED[@]+"${PICKED[@]}"})
     fi
     prepare_paths "${paths[@]}"
   fi
   [[ -n ${TITLE_OVERRIDE:-} ]] && TITLE="$TITLE_OVERRIDE"
 
   # Update the space this source was last published to, unless asked not to.
-  local space_id="" claim_key="" existing=""
+  local space_id="" existing="" secret="{}" claim_key="" anonymous_before=false
   if ((!FORCE_NEW)) && [[ -n $SOURCE ]]; then
     space_id=$(state_find_source "$SOURCE")
     if [[ -n $space_id ]]; then
       existing=$(state_get "$space_id")
-      claim_key=$(jq -r '.claimKey // empty' <<<"$existing")
+      secret=$(secret_get "$space_id")
+      [[ -n $secret ]] || secret="{}"
+      claim_key=$(jq -r '.claimKey // empty' <<<"$secret")
+      anonymous_before=$(jq -r '(.anonymous // false) and ((.claimed // false) | not)' <<<"$existing")
       # An anonymous space past its expiry is gone; start a new one.
-      local expires
-      expires=$(jq -r '.expiresAt // empty' <<<"$existing")
-      if [[ -n $expires ]] && (($(date -d "$expires" +%s 2>/dev/null || echo 0) < $(date +%s))); then
+      if [[ $anonymous_before == true ]] && (($(epoch "$(jq -r '.expiresAt // empty' <<<"$existing")") > 0)) &&
+        (($(epoch "$(jq -r '.expiresAt // empty' <<<"$existing")") < $(date +%s))); then
         state_drop "$space_id"
-        space_id="" claim_key="" existing=""
+        space_id="" claim_key="" existing="" secret="{}" anonymous_before=false
       fi
     fi
   fi
 
-  local warning
-  warning=$(secret_warning "$ROOT")
+  local team=""
+  [[ $ENGINE == api ]] && team=$(team_id)
+  if [[ $ENGINE == api && -z $space_id && -z $team ]] &&
+    (($(account_get | jq '(.teams // []) | length') > 1)); then
+    fail "Pick the team new spaces go to first: omarchy-spacefast team <slug>"
+  fi
 
-  notify "Publishing $TITLE…" "Spacefast"
+  notify "Publishing ${TITLE}…" "Spacefast"
 
-  if ((${#SF[@]})); then
+  # An unclaimed space updates with its own key, signed in or not.
+  if [[ $anonymous_before == true && -n $claim_key ]]; then
+    publish_with_api "$space_id" "$claim_key" ""
+  elif [[ $ENGINE == api ]]; then
+    publish_with_api "$space_id" "$TOKEN" "$team"
+  elif [[ $ENGINE == sf ]]; then
     publish_with_sf "$space_id" "$claim_key" "$message"
+  elif [[ -n $space_id ]]; then
+    fail "$(jq -r '.title' <<<"$existing") belongs to your Spacefast account. Sign in (omarchy-spacefast login) to update it, or publish with --new."
   else
-    publish_with_curl "$space_id" "$claim_key"
+    publish_with_api "" "" ""
   fi
 
   local r=".data"
-  local id live immutable ref anonymous preview claim_url key expires access_url
+  local id live immutable ref preview claim_url key expires
   id=$(jq -r "$r.space.id" <<<"$RECEIPT")
   live=$(jq -r "$r.space.liveUrl // empty" <<<"$RECEIPT")
   immutable=$(jq -r "$r.version.immutableUrl // empty" <<<"$RECEIPT")
-  ref=$(jq -r "$r.version.ref // empty" <<<"$RECEIPT")
+  ref=$(jq -r "$r.version.ref // (if $r.version.number then \"v\\($r.version.number)\" else empty end)" <<<"$RECEIPT")
   preview=$(jq -r "$r.claim.url // empty" <<<"$RECEIPT")
   claim_url=$(jq -r "$r.claim.claimUrl // empty" <<<"$RECEIPT")
   key=$(jq -r "$r.claim.key // empty" <<<"$RECEIPT")
   expires=$(jq -r "$r.claim.expiresAt // empty" <<<"$RECEIPT")
-  access_url=$(jq -r "$r.access.url // empty" <<<"$RECEIPT")
 
-  # Updates of an anonymous space do not repeat the claim block.
-  [[ -z $key ]] && key="$claim_key"
-  if [[ -z $preview && -n $existing ]]; then
-    preview=$(jq -r '.previewUrl // empty' <<<"$existing")
-    claim_url=$(jq -r '.claimUrl // empty' <<<"$existing")
-    expires=$(jq -r '.expiresAt // empty' <<<"$existing")
-  fi
-  anonymous=false
+  # Updates of an anonymous space do not always repeat the claim block.
+  local anonymous=false
+  [[ -z $key && $anonymous_before == true ]] && key="$claim_key"
   [[ -n $key || -n $preview ]] && anonymous=true
+  if [[ $anonymous == true ]]; then
+    [[ -n $preview ]] || preview=$(jq -r '.previewUrl // empty' <<<"$secret")
+    [[ -n $claim_url ]] || claim_url=$(jq -r '.claimUrl // empty' <<<"$secret")
+    # Each publish pushes the expiry back; ask for the current one.
+    if [[ -z $expires && -n $key ]]; then
+      expires=$(claim_status "$key" | jq -r '.expiresAt // empty' 2>/dev/null || true)
+    fi
+    [[ -n $expires ]] || expires=$(jq -r '.expiresAt // empty' <<<"${existing:-$EMPTY_JSON}")
+    secret_put "$id" "$(jq -nc --arg k "$key" --arg p "$preview" --arg c "$claim_url" '
+      {claimKey: $k, previewUrl: $p, claimUrl: $c} | with_entries(select(.value != ""))')"
+  fi
 
   local share_url=""
   if [[ $anonymous == false ]]; then
     share_url=$(jq -r '.shareUrl // empty' <<<"${existing:-$EMPTY_JSON}")
-    if [[ -z $share_url && $ACCESS == link ]] && ((${#SF[@]})); then
+    if [[ -z $share_url && $ACCESS == link ]]; then
       share_url=$(create_share_link "$id" || true)
     fi
   fi
 
-  local now
-  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  state_put "$id" "$(jq -n \
+  state_put "$id" "$(jq -nc \
     --arg spaceId "$id" --arg title "$TITLE" --arg source "$SOURCE" --arg liveUrl "$live" \
     --arg immutableUrl "$immutable" --arg version "$ref" --argjson anonymous "$anonymous" \
-    --arg previewUrl "$preview" --arg claimUrl "$claim_url" --arg claimKey "$key" \
-    --arg expiresAt "$expires" --arg shareUrl "$share_url" --arg accessUrl "$access_url" \
-    --arg publishedAt "$now" --arg engine "$(engine_name)" '
+    --arg expiresAt "$expires" --arg shareUrl "$share_url" --arg publishedAt "$(now_iso)" \
+    --arg engine "$ENGINE" --argjson claimed "$([[ $anonymous == false && $anonymous_before == false && -n $existing ]] && jq '.claimed // false' <<<"$existing" || echo false)" '
     {spaceId:$spaceId, title:$title, source:$source, liveUrl:$liveUrl, immutableUrl:$immutableUrl,
-     version:$version, anonymous:$anonymous, publishedAt:$publishedAt, engine:$engine}
-    + (if $previewUrl != "" then {previewUrl:$previewUrl} else {} end)
-    + (if $claimUrl != "" then {claimUrl:$claimUrl} else {} end)
-    + (if $claimKey != "" then {claimKey:$claimKey} else {} end)
-    + (if $expiresAt != "" then {expiresAt:$expiresAt} else {} end)
+     version:$version, anonymous:$anonymous, claimed:$claimed, publishedAt:$publishedAt, engine:$engine}
+    + (if $anonymous and $expiresAt != "" then {expiresAt:$expiresAt} else {expiresAt:null} end)
     + (if $shareUrl != "" then {shareUrl:$shareUrl} else {} end)
-    + (if $accessUrl != "" then {accessUrl:$accessUrl} else {} end)
   ')"
 
   # The link to hand back: a share link when signed in, the private preview
   # (which only the publisher should use) when anonymous.
-  local link headline body click
+  local link headline body click warning
+  warning=$(secret_warning "$ROOT")
+  headline="Published $TITLE${ref:+ ($ref)}"
   if [[ $anonymous == true ]]; then
     link="${preview:-$live}"
-    headline="Published $TITLE ($ref)"
-    body="Private preview link copied. It can manage the space, so keep it to yourself. Click to claim it and get a link you can share."
+    body="Private preview link copied. It can manage the space, so keep it to yourself. Claim it within $(relative_until "$expires") to keep it and get a link you can share."
     click="$claim_url"
   else
-    link="${share_url:-${access_url:-$live}}"
-    headline="Published $TITLE ($ref)"
+    link="${share_url:-$live}"
     if [[ -n $share_url ]]; then
       body="Share link copied: $share_url"
     elif [[ $ACCESS == public ]]; then
@@ -566,8 +872,8 @@ cmd_publish() {
   fi
   [[ -n $warning ]] && body="$body ($warning)"
 
-  copy_text "$link"
-  if [[ -n $click ]]; then
+  if [[ $anonymous == true ]]; then copy_secret "$link"; else copy_text "$link"; fi
+  if [[ -n $click && $OS != Darwin ]]; then
     notify "$headline" "$body" --exec "$SELF" open-url "$click"
   else
     notify "$headline" "$body"
@@ -576,18 +882,19 @@ cmd_publish() {
   if ((JSON)); then
     jq -n --arg spaceId "$id" --arg title "$TITLE" --arg liveUrl "$live" --arg immutableUrl "$immutable" \
       --arg version "$ref" --argjson anonymous "$anonymous" --arg expiresAt "$expires" \
-      --arg shareUrl "$share_url" --arg engine "$(engine_name)" --arg notice "$warning" \
-      --argjson copied "$COPY" '
+      --arg shareUrl "$share_url" --arg engine "$ENGINE" --arg notice "$warning" \
+      --arg headline "$headline" --arg message "$body" --argjson copied "$COPY" '
       {spaceId:$spaceId, title:$title, version:$version, liveUrl:$liveUrl, immutableUrl:$immutableUrl,
-       anonymous:$anonymous, engine:$engine, linkCopiedToClipboard:($copied == 1)}
+       anonymous:$anonymous, engine:$engine, linkCopiedToClipboard:($copied == 1),
+       headline:$headline, message:$message}
       + (if $shareUrl != "" then {shareUrl:$shareUrl} else {} end)
-      + (if $expiresAt != "" then {claimExpiresAt:$expiresAt,
-           claim:"Run `omarchy-spacefast claim \($spaceId)` to open the claim page. The private preview link carries management rights: never share or print it."} else {} end)
+      + (if $anonymous then {claimExpiresAt:$expiresAt,
+           claim:"Run `omarchy-spacefast claim \($spaceId)` to keep it. The private preview link carries management rights: never share or print it."} else {} end)
       + (if $notice != "" then {notice:$notice} else {} end)'
   else
     echo "$headline"
     if [[ $anonymous == true ]]; then
-      echo "Private preview (copied, keep to yourself): $link"
+      echo "Private preview (copied, keep to yourself)"
       echo "Claim within $(relative_until "$expires") to keep and share it: omarchy-spacefast claim $id"
     else
       echo "Link (copied): $link"
@@ -598,44 +905,64 @@ cmd_publish() {
   return 0
 }
 
-relative_until() {
-  local target now diff
-  target=$(date -d "$1" +%s 2>/dev/null || echo 0)
-  now=$(date +%s)
-  diff=$((target - now))
-  if ((diff <= 0)); then echo "0m"
-  elif ((diff >= 3600)); then echo "$((diff / 3600))h"
-  else echo "$((diff / 60))m"
-  fi
-}
-
 # ---------------------------------------------------------------------------
 # Spaces, links, account
+
+# Ask Spacefast where each unclaimed space stands: claiming happens in the
+# browser, and every publish pushes the expiry back. At most every 5 minutes.
+refresh_unclaimed() {
+  local id secret key status now checked
+  now=$(date +%s)
+  while IFS= read -r id; do
+    checked=$(epoch "$(jq -r --arg id "$id" '.[$id].checkedAt // empty' "$SPACES_FILE")")
+    ((now - checked < 300)) && continue
+    secret=$(secret_get "$id")
+    key=$(jq -r '.claimKey // empty' <<<"${secret:-$EMPTY_JSON}")
+    [[ -n $key ]] || continue
+    status=$(claim_status "$key" 2>/dev/null || true)
+    [[ -n $status ]] || continue
+    if [[ $(jq -r '.state' <<<"$status") == claimed ]]; then
+      state_put "$id" '{"anonymous": false, "claimed": true, "expiresAt": null}'
+    else
+      state_put "$id" "$(jq -c '{expiresAt}' <<<"$status")"
+    fi
+    state_put "$id" "$(jq -nc --arg t "$(now_iso)" '{checkedAt: $t}')"
+  done < <(jq -r 'to_entries[] | select(.value.anonymous == true and (.value.claimed // false | not)) | .key' "$SPACES_FILE")
+}
 
 cmd_spaces() {
   local json=0
   [[ ${1:-} == --json ]] && json=1
   need jq
   state_init
-  resolve_sf
+  resolve_engine
+  refresh_unclaimed
 
   local authenticated=false user="null" remote="[]"
-  if ((${#SF[@]})); then
+  if [[ $ENGINE == api ]]; then
+    authenticated=true
+    user=$(account_get | jq -c '{email, name} | with_entries(select(.value != null))')
+    local cursor="" page=0 items
+    remote="[]"
+    while ((page++ < 10)); do
+      api GET "/v1/spaces?limit=100${cursor:+&cursor=$cursor}" "$TOKEN" || break
+      items=$(jq -c '.data // []' <<<"$API_BODY")
+      remote=$(jq -c --argjson more "$items" '. + $more' <<<"$remote")
+      cursor=$(jq -r 'if .pagination.hasMore then .pagination.nextCursor // empty else empty end' <<<"$API_BODY")
+      [[ -n $cursor ]] || break
+    done
+  elif [[ $ENGINE == sf ]]; then
     local status
     status=$("${SF[@]}" status --json 2>/dev/null || echo '{}')
-    if jq -e '.data.authenticated == true' >/dev/null 2>&1 <<<"$status"; then
-      authenticated=true
-      user=$(jq -c '.data.user // null' <<<"$status")
-      remote=$("${SF[@]}" spaces ls --json --limit 50 2>/dev/null | jq -c '.data // [] | if type == "object" then (.items // []) else . end' 2>/dev/null || echo '[]')
-    fi
+    authenticated=true
+    user=$(jq -c '.data.user // null' <<<"$status")
+    remote=$("${SF[@]}" spaces ls --json --limit 50 2>/dev/null | jq -c '.data // [] | if type == "object" then (.items // []) else . end' 2>/dev/null || echo '[]')
   fi
 
-  local now
-  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
   local merged
-  merged=$(jq -n --slurpfile local "$SPACES_FILE" --argjson remote "$remote" --arg now "$now" \
-    --argjson authenticated "$authenticated" --argjson user "$user" --arg engine "$(engine_name)" '
+  merged=$(jq -n --slurpfile local "$SPACES_FILE" --argjson remote "$remote" --arg now "$(now_iso)" \
+    --argjson authenticated "$authenticated" --argjson user "$user" --arg engine "$ENGINE" \
+    --argjson account "$(account_get)" --arg dashboard "$DASHBOARD_URL" '
     ($local[0] // {}) as $l
     | ($remote | map({key: .id, value: .}) | from_entries) as $r
     | ([$l | keys[]] + [$r | keys[]] | unique) as $ids
@@ -643,52 +970,64 @@ cmd_spaces() {
         | . as $id
         | ($l[$id] // {}) as $a
         | ($r[$id] // {}) as $b
+        | (if $b.id then false else (($a.anonymous // false) and (($a.claimed // false) | not)) end) as $anon
         | {
             id: $id,
             title: ($b.title // $a.title // $b.slug // $id),
             slug: ($b.slug // null),
             liveUrl: ($b.liveUrl // $a.liveUrl // null),
             version: ($a.version // null),
-            anonymous: (if $b.id then ($b.anonymous // false) else ($a.anonymous // false) end),
-            expiresAt: ($a.expiresAt // null),
+            anonymous: $anon,
+            claimed: ($a.claimed // false),
+            expiresAt: (if $anon then $a.expiresAt else null end),
             source: ($a.source // null),
+            teamSlug: ($b.teamSlug // null),
             hasShareLink: (($a.shareUrl // "") != ""),
-            updatedAt: ($b.updatedAt // $a.publishedAt // null),
+            updatedAt: ([$b.updatedAt, $a.publishedAt] | map(select(. != null)) | max),
             publishedHere: ($a.spaceId != null)
           }
         | select((.anonymous | not) or (.expiresAt == null) or (.expiresAt > $now))
       ]
     | sort_by(.updatedAt // "") | reverse
-    | {account: {authenticated: $authenticated, user: $user}, engine: $engine,
-       dashboardUrl: "https://my.spacefast.com", spaces: .}')
+    | {account: {authenticated: $authenticated, user: $user, team: ($account.team // null),
+                 teams: (($account.teams // []) | length)},
+       engine: $engine, dashboardUrl: $dashboard, spaces: .}')
 
   if ((json)); then
     echo "$merged"
   else
     jq -r '
-      (if .account.authenticated then "Signed in (\(.engine))" else "Not signed in (\(.engine)); anonymous publishes expire unless claimed" end),
+      (if .account.authenticated then "Signed in (\(.engine))\(if .account.team then ", new spaces go to \(.account.team.name // .account.team.slug)" else "" end)"
+       else "Not signed in; anonymous publishes expire unless claimed" end),
       "",
-      (.spaces[] | "\(.title)\t\(.liveUrl // "")\t\(if .anonymous then "anonymous, expires \(.expiresAt)" else "" end)")
+      (.spaces[] | "\(.title)\t\(.liveUrl // "")\t\(if .anonymous then "anonymous, expires \(.expiresAt)" else (.teamSlug // "") end)")
     ' <<<"$merged" | column -t -s $'\t'
   fi
+}
+
+is_unclaimed() {
+  local rec="$1"
+  [[ -n $rec ]] && jq -e '(.anonymous // false) and ((.claimed // false) | not)' >/dev/null <<<"$rec"
 }
 
 cmd_open() {
   local id="${1:?space id required}" rec url=""
   state_init
   rec=$(state_get "$id")
-  if [[ -n $rec ]] && [[ $(jq -r '.anonymous' <<<"$rec") == true ]]; then
-    url=$(jq -r '.previewUrl // .liveUrl // empty' <<<"$rec")
+  if is_unclaimed "$rec"; then
+    url=$(secret_get "$id" | jq -r '.previewUrl // empty' 2>/dev/null || true)
+    [[ -n $url ]] || url=$(jq -r '.liveUrl // empty' <<<"$rec")
   else
-    resolve_sf
-    if ((${#SF[@]})); then
-      # `sf open` mints a short-lived author handoff so a private space opens
-      # signed in. --show-secret prints it so Omarchy's browser opens it.
+    resolve_engine
+    if [[ $ENGINE == api ]] && api POST "/v1/spaces/$id/open" "$TOKEN" '{}'; then
+      # A one-time handoff so a private space opens signed in.
+      url=$(jq -r '.data.url // empty' <<<"$API_BODY")
+    elif [[ $ENGINE == sf ]]; then
       url=$("${SF[@]}" open "$id" --show-secret --json --yes 2>/dev/null | jq -r '.data.open.url // empty' 2>/dev/null || true)
     fi
-    [[ -n $url ]] || url=$(jq -r '.accessUrl // .liveUrl // empty' <<<"${rec:-$EMPTY_JSON}")
-    if [[ -z $url ]] && ((${#SF[@]})); then
-      url=$("${SF[@]}" spaces get "$id" --json 2>/dev/null | jq -r '.data.liveUrl // empty' || true)
+    [[ -n $url ]] || url=$(jq -r '.liveUrl // empty' <<<"${rec:-$EMPTY_JSON}")
+    if [[ -z $url && $ENGINE == api ]] && api GET "/v1/spaces/$id" "$TOKEN"; then
+      url=$(jq -r '.data.liveUrl // empty' <<<"$API_BODY")
     fi
   fi
   [[ -n $url ]] || fail "Could not find a URL for $id"
@@ -698,65 +1037,276 @@ cmd_open() {
 cmd_copy() {
   local id="${1:?space id required}" rec link=""
   state_init
-  resolve_sf
+  resolve_engine
   rec=$(state_get "$id")
-  if [[ -n $rec ]] && [[ $(jq -r '.anonymous' <<<"$rec") == true ]]; then
-    link=$(jq -r '.previewUrl // empty' <<<"$rec")
-    copy_text "$link"
+  if is_unclaimed "$rec"; then
+    link=$(secret_get "$id" | jq -r '.previewUrl // empty' 2>/dev/null || true)
+    [[ -n $link ]] || fail "No private preview link saved for $id"
+    copy_secret "$link"
     notify "Private preview link copied" "Keep it to yourself. Claim the space to get a link you can share."
     return
   fi
   link=$(jq -r '.shareUrl // empty' <<<"${rec:-$EMPTY_JSON}")
-  if [[ -z $link ]] && ((${#SF[@]})); then
+  if [[ -z $link && $ENGINE != anonymous ]]; then
     link=$(create_share_link "$id" || true)
     if [[ -n $link ]]; then
-      state_put "$id" "$(jq -n --arg id "$id" --arg u "$link" '{spaceId:$id, shareUrl:$u}')"
+      state_put "$id" "$(jq -nc --arg id "$id" --arg u "$link" --arg t "$(now_iso)" \
+        --argjson prior "${rec:-$EMPTY_JSON}" '{spaceId: $id, shareUrl: $u, title: ($prior.title // $id), publishedAt: ($prior.publishedAt // $t), anonymous: false}')"
     fi
   fi
-  if [[ -z $link ]] && ((${#SF[@]})); then
-    link=$("${SF[@]}" spaces get "$id" --json 2>/dev/null | jq -r '.data.liveUrl // empty' || true)
-  fi
-  [[ -n $link ]] || fail "Could not find a link for $id"
+  [[ -n $link ]] || link=$(jq -r '.liveUrl // empty' <<<"${rec:-$EMPTY_JSON}")
+  [[ -n $link ]] || fail "Could not find a link for $id. Sign in to create share links."
   copy_text "$link"
   notify "Link copied" "$link"
   echo "$link"
 }
 
 cmd_claim() {
-  local id="${1:?space id required}" rec url
+  local id="" browser=0 rec secret key claim_url
+  while (($#)); do
+    case "$1" in
+    --browser) browser=1 ;;
+    *) id="$1" ;;
+    esac
+    shift
+  done
+  [[ -n $id ]] || fail "space id required"
   state_init
   rec=$(state_get "$id")
-  url=$(jq -r '.claimUrl // empty' <<<"${rec:-$EMPTY_JSON}")
-  if [[ -z $url ]]; then
-    open_url "$DASHBOARD_URL"
-    return
+  secret=$(secret_get "$id")
+  key=$(jq -r '.claimKey // empty' <<<"${secret:-$EMPTY_JSON}")
+  claim_url=$(jq -r '.claimUrl // empty' <<<"${secret:-$EMPTY_JSON}")
+  load_token
+
+  # Signed in: claim straight into the default team with the space key.
+  # agentContinuation answers the consent question Spacefast asks for spaces
+  # a tool published; the account key replaces the space key.
+  if ((!browser)) && [[ -n $TOKEN && -n $key ]] && is_unclaimed "$rec"; then
+    local team body
+    team=$(team_id)
+    body=$(jq -nc --arg k "$key" --arg t "$team" '{key: $k, agentContinuation: false} + (if $t != "" then {teamId: $t} else {} end)')
+    if api POST /v1/claim "$TOKEN" "$body" && [[ $(jq -r '.data.state' <<<"$API_BODY") == claimed ]]; then
+      state_put "$id" '{"anonymous": false, "claimed": true, "expiresAt": null}'
+      notify "Claimed $(jq -r '.title // "the space"' <<<"$rec")" "It is now in your Spacefast account."
+      say "Claimed: $id is now in your account."
+      return
+    fi
+    local action
+    action=$(jq -r '.data.action // empty' <<<"$API_BODY" 2>/dev/null || true)
+    say "Spacefast needs you to finish in the browser${action:+ ($action)}."
   fi
-  open_url "$url"
+  open_url "${claim_url:-$DASHBOARD_URL}"
+}
+
+# ---------------------------------------------------------------------------
+# Signing in: the same device flow as `sf login`.
+
+save_account() {
+  local key="$1" key_id="$2" me
+  api GET /v1/me "$key" || fail "Signed in, but could not read the account: $(api_error)"
+  me="$API_BODY"
+  secret_put session "$(jq -nc --arg k "$key" --arg i "$key_id" '{apiKey: $k, apiKeyId: $i}')"
+  jq -c --argjson prior "$(account_get)" '
+    .data as $d
+    | ($d.teams // [] | map({id, name, slug})) as $teams
+    | {email: $d.user.email, name: $d.user.name, teams: $teams,
+       team: (if ($teams | length) == 1 then $teams[0]
+              elif ($prior.team.id // null) as $p | $p and ($teams | any(.id == $p)) then $prior.team
+              else null end)}' <<<"$me" | write_json "$ACCOUNT_FILE"
+}
+
+login_done_message() {
+  local account
+  account=$(account_get)
+  if jq -e '.team' >/dev/null <<<"$account"; then
+    echo "Signed in as $(jq -r '.email // "you"' <<<"$account"). New spaces go to $(jq -r '.team.name // .team.slug' <<<"$account")."
+  else
+    echo "Signed in as $(jq -r '.email // "you"' <<<"$account"). Pick the team new spaces go to: omarchy-spacefast team <slug>"
+  fi
+}
+
+# Polls a device login until approved, denied, or expired.
+device_poll() {
+  local code="$1" interval="$2" expires="$3" status key key_id
+  while (($(date +%s) < $(epoch "$expires"))); do
+    sleep "$interval"
+    if ! api POST /v1/auth/device/poll "" "$(jq -nc --arg c "$code" '{deviceCode: $c}')"; then
+      # A dropped connection or server hiccup: keep waiting. 429 means slow down.
+      [[ $API_STATUS == 429 ]] && interval=$((interval + 5))
+      [[ $API_STATUS == 0 || $API_STATUS == 429 || $API_STATUS == 5* ]] && continue
+      echo "$(api_error)"
+      return 1
+    fi
+    status=$(jq -r '.data.status' <<<"$API_BODY")
+    case $status in
+    pending) continue ;;
+    approved)
+      key=$(jq -r '.data.apiKey.secret // empty' <<<"$API_BODY")
+      key_id=$(jq -r '.data.apiKey.id // empty' <<<"$API_BODY")
+      [[ -n $key ]] || { echo "Approved, but no key came back"; return 1; }
+      save_account "$key" "$key_id"
+      return 0
+      ;;
+    denied) echo "Sign-in was denied in the browser"; return 1 ;;
+    *) echo "The sign-in code expired"; return 1 ;;
+    esac
+  done
+  echo "The sign-in code expired"
+  return 1
 }
 
 cmd_login() {
-  resolve_sf
-  ((${#SF[@]})) || fail "Install the Spacefast CLI first: omarchy-mise-install npm:spacefast sf"
-  if [[ -t 0 ]]; then
-    "${SF[@]}" login "$@"
-  elif command -v omarchy-launch-floating-terminal-with-presentation >/dev/null 2>&1; then
-    omarchy-launch-floating-terminal-with-presentation "${SF[*]} login"
+  local background=0
+  while (($#)); do
+    case "$1" in
+    --sf)
+      resolve_sf
+      ((${#SF[@]})) || fail "The sf CLI is not installed"
+      shift
+      "${SF[@]}" login "$@"
+      return
+      ;;
+    --background) background=1 ;;
+    --json) JSON=1 ;;
+    esac
+    shift
+  done
+  need jq
+  need curl
+  state_init
+
+  # The Omarchy menu has no terminal: sign in inside a floating one.
+  if ((!background)) && [[ ! -t 0 ]] && command -v omarchy-launch-floating-terminal-with-presentation >/dev/null 2>&1; then
+    omarchy-launch-floating-terminal-with-presentation "$SELF login"
+    return
+  fi
+  [[ -t 0 ]] || background=1
+
+  api POST /v1/auth/device "" '{"access":"agent"}' || fail "Could not start sign-in: $(api_error)"
+  local code user_code url interval expires
+  code=$(jq -r '.data.deviceCode' <<<"$API_BODY")
+  user_code=$(jq -r '.data.userCode' <<<"$API_BODY")
+  url=$(jq -r '.data.verificationUrl' <<<"$API_BODY")
+  interval=$(jq -r '.data.interval // 5' <<<"$API_BODY")
+  expires=$(jq -r '.data.expiresAt' <<<"$API_BODY")
+  open_url "$url"
+
+  if ((background)); then
+    # Nothing to wait in (the menu, Alfred): poll in a detached process and
+    # report by notification. The device code goes by environment, not argv.
+    notify "Approve $user_code in your browser" "Sign in with WordPress.com and check the page shows $user_code."
+    SPACEFAST_DEVICE_CODE="$code" SPACEFAST_DEVICE_INTERVAL="$interval" SPACEFAST_DEVICE_EXPIRES="$expires" \
+      nohup "$SELF" __login-wait >/dev/null 2>&1 &
+    if ((JSON)); then
+      jq -nc --arg c "$user_code" --arg u "$url" --arg e "$expires" '{userCode: $c, verificationUrl: $u, expiresAt: $e}'
+    else
+      echo "Approve $user_code in your browser: $url"
+    fi
+    return
+  fi
+
+  echo "Your browser opened $url"
+  echo
+  echo "    $user_code"
+  echo
+  echo "Sign in with WordPress.com, check the page shows this code, and approve."
+  echo "(The page names the Spacefast CLI: this signs in the same way.)"
+  local problem
+  if problem=$(device_poll "$code" "$interval" "$expires"); then
+    echo
+    login_done_message
   else
-    "${SF[@]}" login "$@"
+    fail "$problem"
+  fi
+}
+
+cmd_login_wait() {
+  NOTIFY=1
+  state_init
+  local problem
+  if problem=$(device_poll "$SPACEFAST_DEVICE_CODE" "$SPACEFAST_DEVICE_INTERVAL" "$SPACEFAST_DEVICE_EXPIRES"); then
+    notify "Signed in to Spacefast" "$(login_done_message)"
+  else
+    notify -u critical "Could not sign in" "$problem"
+  fi
+}
+
+cmd_logout() {
+  state_init
+  local session key key_id revoked=true
+  session=$(secret_get session)
+  key=$(jq -r '.apiKey // empty' <<<"${session:-$EMPTY_JSON}")
+  key_id=$(jq -r '.apiKeyId // empty' <<<"${session:-$EMPTY_JSON}")
+  if [[ -z $key ]]; then
+    say "Not signed in here."
+    return
+  fi
+  if [[ -n $key_id ]]; then
+    api DELETE "/v1/api-keys/$key_id" "$key" || revoked=false
+  fi
+  secret_del session
+  rm -f "$ACCOUNT_FILE"
+  if [[ $revoked == true ]]; then
+    say "Signed out. This machine's key is revoked."
+  else
+    say "Signed out. Spacefast did not revoke the key; remove it under API keys at $DASHBOARD_URL."
+  fi
+  notify "Signed out of Spacefast" ""
+}
+
+cmd_team() {
+  local want="" json=0
+  while (($#)); do
+    case "$1" in
+    --json) json=1 ;;
+    *) want="$1" ;;
+    esac
+    shift
+  done
+  state_init
+  load_token
+  [[ -n $TOKEN ]] || fail "Sign in first: omarchy-spacefast login"
+  # Refresh the team list from the account.
+  if api GET /v1/me "$TOKEN"; then
+    jq -c --argjson prior "$(account_get)" '
+      .data as $d | ($d.teams // [] | map({id, name, slug})) as $teams
+      | $prior + {email: $d.user.email, name: $d.user.name, teams: $teams}' <<<"$API_BODY" | write_json "$ACCOUNT_FILE"
+  fi
+  local account
+  account=$(account_get)
+  if [[ -n $want ]]; then
+    local team
+    team=$(jq -c --arg t "$want" '(.teams // [])[] | select(.slug == $t or .id == $t or .name == $t)' <<<"$account" | head -1)
+    [[ -n $team ]] || fail "No team called $want. Run omarchy-spacefast team to list them."
+    jq -c --argjson t "$team" '.team = $t' <<<"$account" | write_json "$ACCOUNT_FILE"
+    say "New spaces go to $(jq -r '.name // .slug' <<<"$team")."
+    ((json)) && jq -c '.team' "$ACCOUNT_FILE"
+    return 0
+  fi
+  if ((json)); then
+    jq -c '{team, teams}' <<<"$account"
+  else
+    jq -r '.team.id as $cur | (.teams // [])[] | "\(if .id == $cur then "*" else " " end) \(.slug)\t\(.name)"' <<<"$account" | column -t -s $'\t'
   fi
 }
 
 cmd_status() {
-  resolve_sf
-  local authenticated=false
-  signed_in && authenticated=true
+  state_init
+  resolve_engine
+  local account authenticated=false
+  account=$(account_get)
+  [[ $ENGINE == api || $ENGINE == sf ]] && authenticated=true
   if [[ ${1:-} == --json ]]; then
-    jq -n --arg engine "$(engine_name)" --argjson authenticated "$authenticated" --arg version "$VERSION" \
-      '{version:$version, engine:$engine, authenticated:$authenticated}'
+    jq -n --arg engine "$ENGINE" --argjson authenticated "$authenticated" --arg version "$VERSION" \
+      --argjson account "$account" --arg state "$STATE_DIR" '
+      {version:$version, engine:$engine, authenticated:$authenticated, stateDir:$state,
+       email:($account.email // null), team:($account.team // null), teams:(($account.teams // []) | length)}'
   else
     echo "omarchy-spacefast $VERSION"
-    echo "Engine: $(engine_name)"
-    echo "Signed in: $authenticated"
+    echo "Engine: $ENGINE"
+    echo "Signed in: $authenticated$([[ $ENGINE == api ]] && jq -r '" as \(.email // "?")"' <<<"$account")"
+    [[ $ENGINE == api ]] && echo "New spaces go to: $(jq -r '.team.name // .team.slug // "(pick one: omarchy-spacefast team <slug>)"' <<<"$account")"
+    return 0
   fi
 }
 
@@ -779,6 +1329,9 @@ open-url) shift; open_url "${1:?url required}" ;;
 copy) shift; cmd_copy "$@" ;;
 claim) shift; cmd_claim "$@" ;;
 login) shift; cmd_login "$@" ;;
+__login-wait) cmd_login_wait ;;
+logout) shift; cmd_logout ;;
+team | teams) shift; cmd_team "$@" ;;
 status) shift; cmd_status "$@" ;;
 panel) shift; cmd_panel "$@" ;;
 dashboard) open_url "$DASHBOARD_URL" ;;

@@ -19,7 +19,8 @@ clipboard, a notification tells you it's up, and the SF in your bar keeps track 
 - **Safe by default.** Spaces start private. Claim keys are stored mode 600 and never printed.
   `.env*`, `.git`, and `node_modules` never leave your machine.
 - **Plain and inspectable.** One bash script with `jq` and `curl`. No daemon. The uninstaller
-  removes exactly what the installer added.
+  removes exactly what the installer added. The same script runs on macOS: the
+  [Alfred workflow](https://github.com/alansmodic/alfred-spacefast) bundles it.
 - **Real hosting.** Spacefast runs on WordPress.com infrastructure. Every publish is an
   immutable version, and republishing updates the same space instead of making a new one.
 
@@ -71,9 +72,9 @@ publishing falls back to a single anonymous upload with curl.
 
 ## How publishing works
 
-- **Engine.** `omarchy-spacefast` uses `sf` if it's installed, then `npx spacefast`, and
-  otherwise zips the files and uploads them with curl. Set `OMARCHY_SPACEFAST_ENGINE=curl` to
-  force the curl path.
+- **Engine.** `omarchy-spacefast` zips the files and publishes them over the Spacefast HTTP API
+  with curl. If you are not signed in here but the `sf` CLI is, it publishes through `sf`
+  instead. `OMARCHY_SPACEFAST_ENGINE=curl` or `=sf` forces one.
 - **Updates, not duplicates.** Publishing the same file or folder again updates its space and
   adds a new immutable version (`v2`, `v3`, …). Use `--new` to create a separate space.
 - **Anonymous (not signed in).**
@@ -82,12 +83,14 @@ publishing falls back to a single anonymous upload with curl.
     can manage the space.
   - The space expires about 33 hours after the last publish unless you claim it. Claiming signs
     you in with WordPress.com. Click the notification, or run `omarchy-spacefast claim <id>`.
-- **Signed in (`omarchy-spacefast login`).**
+- **Signed in (`omarchy-spacefast login`).** The same device flow as `sf login`: approve a code in
+  the browser. If your account has several teams, pick where new spaces go with
+  `omarchy-spacefast team <slug>`. `omarchy-spacefast logout` revokes this machine's key.
   - The space is kept.
   - A viewer share link is created and copied. Set `OMARCHY_SPACEFAST_ACCESS=public` to make
     new spaces public, or `=private` to skip the share link.
-- **What gets left out.** `.env*` files, `.git`, `node_modules` and `.spacefast` are never
-  uploaded. With `sf`, git-ignored files are left out too.
+- **What gets left out.** `.env*` files, `.git`, `node_modules`, `.spacefast`, `.DS_Store` and
+  symlinks are never uploaded. Inside a git repository, git-ignored files are left out too.
 - **Clipboard.** Images become an image page, HTML is published as-is, and text becomes a
   readable page.
 
@@ -97,25 +100,31 @@ omarchy-spacefast publish report.html      # one file
 omarchy-spacefast publish clipboard        # whatever is on the clipboard
 omarchy-spacefast spaces                   # recent publishes + your account's spaces
 omarchy-spacefast copy|open|claim <id>
+omarchy-spacefast login | logout | team [slug]
 omarchy-spacefast status
 ```
 
 ## Known issues
 
 - **Several teams, no default.** If your Spacefast account belongs to more than one team, new
-  spaces need a team. Pick a default once with `sf teams switch <slug>` (or
-  `npx spacefast teams switch <slug>`), or pass `--team <slug>` / set `SPACEFAST_TEAM`.
+  spaces need a team: pick one with `omarchy-spacefast team <slug>`, or pass `--team <slug>` /
+  set `SPACEFAST_TEAM`. (If you narrow the sign-in to one team on the approval page, that team
+  is used.)
+- **The approval page says "Spacefast CLI".** Device sign-in only accepts client ids Spacefast
+  already knows, so this signs in as the CLI does.
 - **`sf` through mise.** mise's supply-chain check currently refuses `spacefast@0.4.1` from npm.
   An earlier release was published with npm trusted-publisher provenance and this one has none.
-  The installers detect this, remove the broken `sf` wrapper, and publishing falls back to
-  `npx spacefast` (or curl without Node). The fix belongs upstream: publishing `spacefast`
-  releases with provenance. Until then, don't bypass mise's trust policy just for this.
+  The installers detect this and remove the broken `sf` wrapper. Nothing depends on `sf` any
+  more: publishing and signing in go straight to the API. The fix belongs upstream: publishing
+  `spacefast` releases with provenance.
 
 ## Security notes
 
-- Claim keys and anonymous preview links are stored only in
-  `~/.local/state/omarchy-spacefast/spaces.json` (mode 600). `--json` output, the bar widget, and
-  the agent skill never show them.
+- Space keys, anonymous preview links, and the sign-in key are stored only in
+  `~/.local/state/omarchy-spacefast/secrets.json` (mode 600; the macOS Keychain on a Mac).
+  `spaces.json` holds nothing secret, and 0.1's keys move out of it on first run. `--json`
+  output, the bar widget, and the agent skill never show them. On macOS, preview links are
+  copied as concealed so clipboard history does not keep them.
 - The bar panel takes keyboard focus when it opens. So publishing and signing in are
   **click-only**: a stray keystroke can't send anything to the internet. Every publish from the
   menu or panel also goes through the file chooser, except "Clipboard", which you pick
